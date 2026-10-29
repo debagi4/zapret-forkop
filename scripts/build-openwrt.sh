@@ -26,6 +26,12 @@ WRAPPER
 chmod +x "$tmp/cc" "$tmp/ar"
 export CC_aarch64_unknown_linux_musl="$tmp/cc"
 export AR_aarch64_unknown_linux_musl="$tmp/ar"
-export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$tmp/cc"
-export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-self-contained=no"
+if [ -n "${ZAPRET_LINKER:-}" ]; then
+    command -v "$ZAPRET_LINKER" >/dev/null 2>&1 || { echo "Linker not found: $ZAPRET_LINKER" >&2; exit 1; }
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$ZAPRET_LINKER"
+    export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-self-contained=yes"
+else
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$tmp/cc"
+    export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-self-contained=no"
+fi
 "$CARGO" build --release --locked --target aarch64-unknown-linux-musl
