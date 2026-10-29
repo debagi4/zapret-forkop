@@ -1,0 +1,7 @@
+{
+  "luci-app-zapret-forkop": {
+    "description": "Configure Zapret profiles",
+    "read": {"uci": ["zapret_forkop"]},
+    "write": {"uci": ["zapret_forkop"]}
+  }
+}

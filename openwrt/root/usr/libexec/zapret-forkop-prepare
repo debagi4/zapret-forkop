@@ -1,0 +1,96 @@
+#!/bin/sh
+# Build and validate an isolated candidate. Never changes live state.
+set -f
+umask 077
+
+# Overrides are for isolated tests only; the procd init script clears them.
+functions_file="${ZAPRET_FORKOP_FUNCTIONS:-/lib/functions.sh}"
+nfqws="${ZAPRET_FORKOP_NFQWS:-/opt/zapret/nfq/nfqws}"
+nft="${ZAPRET_FORKOP_NFT:-/usr/sbin/nft}"
+tmp_root="${ZAPRET_FORKOP_TMP_ROOT:-/var/run/zapret-forkop}"
+. "$functions_file" || exit 1
+
+fail() { echo "zapret-forkop: $*" >&2; exit 1; }
+[ -x "$nfqws" ] || fail "nfqws not found: $nfqws"
+[ -x "$nft" ] || fail "nft executable not found: $nft"
+mkdir -p "$tmp_root" || fail "cannot create runtime directory"
+stage=$(mktemp -d "$tmp_root/candidate.XXXXXXXX") || fail "cannot create candidate"
+success=0
+cleanup() { [ "$success" = 1 ] || rm -rf "$stage"; }
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+: > "$stage/manifest" || fail "cannot create manifest"
+: > "$stage/marks"
+: > "$stage/outgoing"
+: > "$stage/incoming"
+
+prepare_profile() {
+    local section="$1" enabled slot name strategy port queue mark ctmark arg option count
+    config_get_bool enabled "$section" enabled 0
+    [ "$enabled" = 1 ] || return 0
+    config_get slot "$section" slot
+    config_get name "$section" name
+    config_get strategy "$section" strategy
+    case "$slot" in ''|*[!0-9]*) fail "invalid profile number in $section";; esac
+    case "$slot" in 0*|????*) fail "profile number must be between 1 and 254";; esac
+    [ "$slot" -ge 1 ] && [ "$slot" -le 254 ] || fail "profile number must be between 1 and 254"
+    [ -n "$name" ] || fail "profile $section has no name"
+    grep -qx "$slot" "$stage/slots" 2>/dev/null && fail "duplicate profile number $slot"
+    echo "$slot" >> "$stage/slots"
+    [ -n "$strategy" ] || fail "profile $section has an empty strategy"
+
+    port=$((11079 + slot))
+    queue=$((4399 + slot))
+    ctmark=$((0x5100 + slot))
+    mark=$((0x08005100 + slot))
+    printf '%s\n' "--qnum=$queue" "--dpi-desync-fwmark=0x40000000" > "$stage/$slot.args"
+    count=0
+    # No eval: only option tokens in --name or --name=value form.
+    for arg in $strategy; do
+        case "$arg" in --*) ;; *) fail "profile $section contains a non-option argument";; esac
+        case "$arg" in *\"*|*\'*|*\\*|*\`*) fail "profile $section contains quoting or escapes";; esac
+        option=${arg%%=*}
+        case "$option" in
+            --qnum|--dpi-desync-fwmark|--dry-run|--version|--daemon|--pidfile|--user|--uid)
+                fail "profile $section contains service-managed option $option";;
+        esac
+        printf '%s\n' "$arg" >> "$stage/$slot.args"
+        count=$((count + 1))
+    done
+    [ "$count" -gt 0 ] || fail "profile $section has an empty strategy"
+
+    cp "$stage/$slot.args" "$stage/$slot.check" || fail "cannot prepare check"
+    printf '%s\n' '--dry-run' >> "$stage/$slot.check"
+    "$nfqws" "@$stage/$slot.check" > "$stage/$slot.check.log" 2>&1 || {
+        cat "$stage/$slot.check.log" >&2
+        fail "nfqws rejected strategy in profile $section"
+    }
+    rm -f "$stage/$slot.check" "$stage/$slot.check.log"
+
+    printf '%s %s %s %s %s\n' "$slot" "$port" "$queue" "$mark" "$ctmark" >> "$stage/manifest"
+    printf '    meta mark 0x%08x ct mark set ct mark | 0x%08x\n' "$mark" "$ctmark" >> "$stage/marks"
+    printf '    meta mark 0x%08x meta l4proto { tcp, udp } ct direction original ct original packets 1-12 counter queue num %s bypass\n' "$mark" "$queue" >> "$stage/outgoing"
+    printf '    ct mark & 0x0000ffff == 0x%08x meta l4proto { tcp, udp } ct direction reply ct reply packets 1-12 counter queue num %s bypass\n' "$ctmark" "$queue" >> "$stage/incoming"
+}
+
+config_load zapret_forkop || fail "cannot load configuration"
+config_foreach prepare_profile profile
+{
+    printf '%s\n' 'table inet zapret_forkop {'
+    printf '%s\n' ' chain mark_connections { type filter hook output priority -149; policy accept;'
+    cat "$stage/marks"
+    printf '%s\n' ' }' ' chain outgoing { type filter hook postrouting priority 101; policy accept;' '    meta mark & 0x40000000 != 0 return'
+    cat "$stage/outgoing"
+    printf '%s\n' ' }' ' chain incoming { type filter hook prerouting priority -99; policy accept;'
+    cat "$stage/incoming"
+    printf '%s\n' ' }' '}'
+} > "$stage/rules.nft" || fail "cannot prepare rules"
+
+{
+    "$nft" list table inet zapret_forkop >/dev/null 2>&1 && printf '%s\n' 'delete table inet zapret_forkop'
+    cat "$stage/rules.nft"
+} > "$stage/check.nft"
+"$nft" -c -f "$stage/check.nft" || fail "nftables rejected candidate rules"
+rm -f "$stage/check.nft" "$stage/marks" "$stage/outgoing" "$stage/incoming" "$stage/slots"
+success=1
+printf '%s\n' "$stage"

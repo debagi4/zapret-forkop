@@ -1,0 +1,87 @@
+name: Build and release
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test and build ARM64 package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          rustup target add aarch64-unknown-linux-musl
+      - name: Verify formatting, tests and lint
+        run: |
+          cargo fmt -- --check
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo build --locked
+      - name: Test SOCKS TCP and UDP on Linux
+        run: sudo python3 tests/socks_smoke.py
+      - name: Test profile manager and LuCI
+        run: |
+          for test in tests/profile/test_*.sh; do sh "$test"; done
+          node tests/profile/test_luci.js
+      - name: Install Zig 0.14.1
+        run: |
+          curl -fL --retry 3 -o zig.tar.xz https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz
+          echo '24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c  zig.tar.xz' | sha256sum -c -
+          tar -xf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-0.14.1" >> "$GITHUB_PATH"
+      - name: Build and verify OpenWrt ARM64 binary
+        run: |
+          ./scripts/build-openwrt.sh
+          binary=target/aarch64-unknown-linux-musl/release/zapret-forkop
+          file "$binary" | grep -E 'ELF 64-bit.*ARM aarch64.*statically linked'
+          sh tests/installer/test_install.sh "$binary"
+      - name: Package and checksum
+        run: |
+          mkdir -p dist
+          ./scripts/package-openwrt.sh target/aarch64-unknown-linux-musl/release/zapret-forkop dist/zapret-forkop-openwrt-aarch64.tar.gz
+          for path in install.sh rollback.sh LICENSE INSTALL.md root/usr/sbin/zapret-forkop root/etc/init.d/zapret-forkop root/www/luci-static/resources/view/zapret-forkop/profiles.js; do
+            tar -tzf dist/zapret-forkop-openwrt-aarch64.tar.gz | grep -Fx "$path"
+          done
+          (cd dist && sha256sum zapret-forkop-openwrt-aarch64.tar.gz > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zapret-forkop-openwrt-aarch64
+          path: |
+            dist/zapret-forkop-openwrt-aarch64.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    name: Publish tagged release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$GITHUB_REF_NAME" = "v$version" || { echo "Tag must match Cargo.toml version $version"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          name: zapret-forkop-openwrt-aarch64
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/zapret-forkop-openwrt-aarch64.tar.gz dist/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag

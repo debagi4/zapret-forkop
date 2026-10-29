@@ -1,0 +1,8 @@
+{
+  "admin/services/zapret-forkop": {
+    "title": "Zapret for Forkop",
+    "order": 70,
+    "action": {"type": "view", "path": "zapret-forkop/profiles"},
+    "depends": {"acl": ["luci-app-zapret-forkop"]}
+  }
+}

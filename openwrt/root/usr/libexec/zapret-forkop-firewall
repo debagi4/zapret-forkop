@@ -1,0 +1,19 @@
+#!/bin/sh
+# Firewall reload hook. No-op when the app is stopped.
+set -u
+nft=/usr/sbin/nft
+runtime=/var/run/zapret-forkop
+lockfile=/var/lock/zapret-forkop.lock
+
+lock "$lockfile" || exit 1
+cleanup() { lock -u "$lockfile"; }
+trap cleanup EXIT HUP INT TERM
+[ -e "$runtime/current/rules.nft" ] || exit 0
+"$nft" list table inet forkop_zapret_bridge >/dev/null 2>&1 && {
+    echo 'zapret-forkop: old bridge table exists; cannot restore rules' >&2
+    exit 1
+}
+{
+    "$nft" list table inet zapret_forkop >/dev/null 2>&1 && echo 'delete table inet zapret_forkop'
+    cat "$runtime/current/rules.nft"
+} | "$nft" -f -

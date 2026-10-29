@@ -1,0 +1,250 @@
+#!/bin/sh /etc/rc.common
+# Experimental: do not deploy until lifecycle and rollback tests run on OpenWrt.
+START=98
+STOP=10
+# rc.common only exposes running/status automatically for USE_PROCD services.
+# We register procd instances manually so preserve our transactional start/reload.
+EXTRA_COMMANDS="running status"
+EXTRA_HELP="\trunning\tCheck if the service is running\n\tstatus\tShow the procd service status\n"
+
+RUNTIME=/var/run/zapret-forkop
+PREPARE=/usr/libexec/zapret-forkop-prepare
+BRIDGE=/usr/sbin/zapret-forkop
+NFQWS=/opt/zapret/nfq/nfqws
+NFT=/usr/sbin/nft
+SERVICE=zapret-forkop
+LOCK=/var/lock/zapret-forkop.lock
+
+. /lib/functions/procd.sh
+
+service_triggers() {
+    procd_add_reload_trigger zapret_forkop
+}
+
+register_stage() {
+    local stage="$1" slot port queue mark ctmark
+    procd_open_service "$SERVICE" "$initscript"
+    while read -r slot port queue mark ctmark; do
+        [ -n "$slot" ] || continue
+        procd_open_instance "nfqws_$slot"
+        procd_set_param command "$NFQWS" "@$stage/$slot.args"
+        procd_set_param respawn 3600 5 5
+        procd_set_param stdout 1
+        procd_set_param stderr 1
+        procd_close_instance
+        procd_open_instance "socks_$slot"
+        procd_set_param command "$BRIDGE" "$port" "$(printf '0x%x' "$mark")"
+        procd_set_param respawn 3600 5 5
+        procd_set_param stdout 1
+        procd_set_param stderr 1
+        procd_close_instance
+    done < "$stage/manifest"
+    procd_close_service set
+}
+
+apply_rules() {
+    local stage="$1"
+    {
+        "$NFT" list table inet zapret_forkop >/dev/null 2>&1 && echo 'delete table inet zapret_forkop'
+        cat "$stage/rules.nft"
+    } | "$NFT" -f -
+}
+
+remove_rules() {
+    "$NFT" list table inet zapret_forkop >/dev/null 2>&1 &&
+        "$NFT" delete table inet zapret_forkop
+    return 0
+}
+
+check_conntrack_accounting() {
+    [ "$(cat /proc/sys/net/netfilter/nf_conntrack_acct 2>/dev/null)" = 1 ]
+}
+
+# On a cold boot the NFQUEUE module may not yet be loaded, so its proc file
+# does not exist. Load it before checking whether queue numbers are occupied.
+# If loading or inspection fails, do not register any instances.
+ensure_queue_support() {
+    local queue_file="${1:-/proc/net/netfilter/nfnetlink_queue}"
+    [ -r "$queue_file" ] && return 0
+    if ! command -v modprobe >/dev/null 2>&1 || ! modprobe nfnetlink_queue >/dev/null 2>&1; then
+        echo "zapret-forkop: unable to load nfnetlink_queue" >&2
+        return 1
+    fi
+    [ -r "$queue_file" ] || {
+        echo "zapret-forkop: NFQUEUE ownership information is unavailable" >&2
+        return 1
+    }
+}
+
+service_pid() {
+    local instance="$1" pid
+    pid=$(ubus call service list '{"name":"zapret-forkop"}' 2>/dev/null |
+        jsonfilter -e "@['zapret-forkop'].instances['$instance'].pid")
+    case "$pid" in ''|*[!0-9]*) return 1;; esac
+    printf '%s\n' "$pid"
+}
+
+port_owners() {
+    local port="$1" data
+    data=$(netstat -lntp 2>/dev/null) || return 1
+    printf '%s\n' "$data" | awk -v port="$port"         '$1 ~ /^tcp/ && $4 ~ (":" port "$") && $6 == "LISTEN" { print $7 }'
+}
+
+queue_portid() {
+    local queue="$1"
+    [ -r /proc/net/netfilter/nfnetlink_queue ] || return 1
+    awk -v queue="$queue" '$1 == queue { print $2 }' /proc/net/netfilter/nfnetlink_queue
+}
+
+netlink_owned_by() {
+    local portid="$1" pid="$2" inode fd target
+    [ -r /proc/net/netlink ] || return 1
+    inode=$(awk -v portid="$portid" '$2 == 12 && $3 == portid { print $10; exit }' /proc/net/netlink)
+    case "$inode" in ''|*[!0-9]*) return 1;; esac
+    for fd in /proc/"$pid"/fd/*; do
+        target=$(readlink "$fd" 2>/dev/null || true)
+        [ "$target" = "socket:[$inode]" ] && return 0
+    done
+    return 1
+}
+
+check_stage() {
+    local stage="$1" mode="$2" slot port queue mark ctmark socks_pid nfq_pid owners owner owner_pid qid
+    while read -r slot port queue mark ctmark; do
+        [ -n "$slot" ] || continue
+        socks_pid=$(service_pid "socks_$slot" || true)
+        nfq_pid=$(service_pid "nfqws_$slot" || true)
+        owners=$(port_owners "$port") || return 1
+        for owner in $owners; do
+            owner_pid=${owner%%/*}
+            case "$owner_pid" in ''|*[!0-9]*) echo "zapret-forkop: cannot identify listener on port $port" >&2; return 1;; esac
+            [ -n "$socks_pid" ] && [ "$owner_pid" = "$socks_pid" ] || {
+                echo "zapret-forkop: port $port belongs to $owner" >&2; return 1;
+            }
+        done
+        qid=$(queue_portid "$queue") || {
+            echo "zapret-forkop: cannot inspect NFQUEUE ownership" >&2; return 1;
+        }
+        for qid in $qid; do
+            [ -n "$nfq_pid" ] && netlink_owned_by "$qid" "$nfq_pid" || {
+                echo "zapret-forkop: queue $queue belongs to another process" >&2; return 1;
+            }
+        done
+        if [ "$mode" = ready ]; then
+            [ -n "$owners" ] && [ -n "$qid" ] || return 1
+            procd_running "$SERVICE" "socks_$slot" || return 1
+            procd_running "$SERVICE" "nfqws_$slot" || return 1
+        fi
+    done < "$stage/manifest"
+    return 0
+}
+
+wait_for_stage() {
+    local stage="$1" attempt=0 stable=0
+    while [ "$attempt" -lt 20 ]; do
+        if check_stage "$stage" ready >/dev/null 2>&1; then
+            stable=$((stable + 1))
+            [ "$stable" -ge 2 ] && return 0
+        else
+            stable=0
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    echo "zapret-forkop: instances did not reach a stable running state" >&2
+    return 1
+}
+
+start_locked() {
+    local stage old link rc
+    # Test overrides must never influence the root service.
+    unset ZAPRET_FORKOP_FUNCTIONS ZAPRET_FORKOP_NFQWS ZAPRET_FORKOP_NFT ZAPRET_FORKOP_TMP_ROOT
+    [ -x "$BRIDGE" ] || { echo "zapret-forkop: Rust bridge is missing" >&2; return 1; }
+    check_conntrack_accounting || {
+        echo "zapret-forkop: nf_conntrack_acct must be enabled before starting" >&2
+        return 1
+    }
+    "$NFT" list table inet forkop_zapret_bridge >/dev/null 2>&1 && {
+        echo "zapret-forkop: old bridge table exists; refusing overlapping queues and marks" >&2
+        return 1
+    }
+    ensure_queue_support || return 1
+    stage=$("$PREPARE") || return 1
+    if ! check_stage "$stage" preflight; then
+        rm -rf "$stage"
+        return 1
+    fi
+    old=$(readlink "$RUNTIME/current" 2>/dev/null || true)
+    [ -f "$old/manifest" ] || old=
+    link="$RUNTIME/current.next.$$"
+    ln -s "$stage" "$link" || { rm -rf "$stage"; return 1; }
+
+    # procd adopts the complete instance set only after candidate validation.
+    # If registration or nft fails, restore the prior instance set.
+    if ! register_stage "$stage"; then
+        if [ -n "$old" ]; then
+            register_stage "$old" || echo "zapret-forkop: failed to restore prior procd instances" >&2
+        else
+            procd_kill "$SERVICE" || echo "zapret-forkop: failed to remove procd instances" >&2
+        fi
+        rm -f "$link"
+        # Keep candidate files: procd may still reference them if restoration failed.
+        return 1
+    fi
+    if ! wait_for_stage "$stage"; then
+        if [ -n "$old" ]; then
+            register_stage "$old" || echo "zapret-forkop: failed to restore prior procd instances" >&2
+        else
+            procd_kill "$SERVICE" || echo "zapret-forkop: failed to remove procd instances" >&2
+        fi
+        rm -f "$link"
+        return 1
+    fi
+    if ! apply_rules "$stage"; then
+        if [ -n "$old" ]; then
+            register_stage "$old" || echo "zapret-forkop: failed to restore prior procd instances" >&2
+        else
+            procd_kill "$SERVICE" || echo "zapret-forkop: failed to remove procd instances" >&2
+        fi
+        rm -f "$link"
+        return 1
+    fi
+    if ! mv -Tf "$link" "$RUNTIME/current"; then
+        if [ -n "$old" ]; then
+            apply_rules "$old" || echo "zapret-forkop: failed to restore prior nft rules" >&2
+            register_stage "$old" || echo "zapret-forkop: failed to restore prior procd instances" >&2
+        else
+            remove_rules
+            procd_kill "$SERVICE" || echo "zapret-forkop: failed to remove procd instances" >&2
+        fi
+        rm -f "$link"
+        return 1
+    fi
+    # Candidates are in tmpfs and retained for procd respawns and rollback.
+    echo "zapret-forkop: configuration accepted; verify that all instances are running" >&2
+}
+
+start() {
+    lock "$LOCK" || return 1
+    start_locked
+    local status=$?
+    lock -u "$LOCK"
+    return "$status"
+}
+
+reload() { start; }
+
+# procd invokes this after updating service instances. Keep it silent and
+# read-only, and match the standard rc.common procd exit semantics.
+running() { procd_running "$SERVICE" "${1:-*}"; }
+status() { _procd_status "$SERVICE" "${1:-}"; }
+
+stop() {
+    lock "$LOCK" || return 1
+    procd_kill "$SERVICE"
+    remove_rules
+    rm -f "$RUNTIME/current"
+    lock -u "$LOCK"
+}
+
+restart() { reload; }
