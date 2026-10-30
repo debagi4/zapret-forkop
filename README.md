@@ -17,6 +17,16 @@ experimental procd manager validates nfqws arguments and nftables, checks
 listener and queue ownership, starts instances and attempts rollback on
 application errors. Details and limitations: [OpenWrt profiles](docs/openwrt-profiles.md).
 
+## Screenshots
+
+Profile list in LuCI:
+
+![Zapret for Forkop profile list](docs/screenshots/profiles.jpg)
+
+Strategy editor:
+
+![Zapret strategy editor](docs/screenshots/strategy-editor.jpg)
+
 ## Current limitations
 
 - The old forkop-zapret-bridge is retained on the test router as a rollback
