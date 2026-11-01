@@ -34,6 +34,10 @@ Extract the bundle on the router, inspect its contents, and run its
   named temporary UCI copy, preserving separately staged firewall changes;
 - installs a sysupgrade keep list containing the application files and profiles.
 
+After installation, run `/etc/init.d/rpcd reload` and remove
+`/tmp/luci-indexcache*` and `/tmp/luci-modulecache` so LuCI picks up the new
+ACL and menu entry; the installer prints this hint but does not do it itself.
+
 It does **not** start, stop, enable or disable either service and does not
 reload firewall or Forkop. Existing /opt/zapret binaries, fake packet files,
 and the old bridge must be backed up separately. This bundle doesn't install

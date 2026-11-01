@@ -1,5 +1,3 @@
-#[cfg(test)]
-mod profile;
 mod resolver;
 mod socks;
 use std::{
@@ -20,6 +18,19 @@ struct Config {
     dns_mark: u32,
     resolver: resolver::Resolver,
     udp_pending: Arc<Semaphore>,
+    udp_sessions: Arc<Semaphore>,
+}
+
+/// Peers closing or resetting a relayed connection is normal; logging every
+/// occurrence would flood the small logd ring buffer.
+fn is_routine(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    )
 }
 
 fn marked_socket(
@@ -161,6 +172,13 @@ async fn serve(mut client: TcpStream, cfg: Arc<Config>) -> io::Result<()> {
                     return Ok(());
                 }
             };
+            // Bounds per-association buffers and descriptors independently of TCP clients.
+            let Ok(_session) = cfg.udp_sessions.clone().try_acquire_owned() else {
+                client
+                    .write_all(&socks::reply(1, "0.0.0.0:0".parse().unwrap()))
+                    .await?;
+                return Ok(());
+            };
             let relay = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
             client
                 .write_all(&socks::reply(0, relay.local_addr()?))
@@ -191,8 +209,9 @@ async fn udp_relay(
     )?;
     sock.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())?;
     let remote = UdpSocket::from_std(sock.into())?;
-    let mut from_client = vec![0; 65535];
-    let mut from_remote = vec![0; 65535];
+    // Both directions share one buffer: sockets are read only after readiness,
+    // so no receive future borrows it across the select.
+    let mut buf = vec![0; 65535];
     let mut client_addr = None;
     let mut control_byte = [0u8; 1];
     let mut permitted = std::collections::HashSet::new();
@@ -207,20 +226,25 @@ async fn udp_relay(
     loop {
         tokio::select! {
             r = control.read(&mut control_byte) => { if r? == 0 { return Ok(()); } }
-            r = relay.recv_from(&mut from_client) => {
-                let (n, addr) = r?;
+            r = relay.readable() => {
+                r?;
+                let (n, addr) = match relay.try_recv_from(&mut buf) {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e),
+                };
                 if addr.ip() != peer.ip() || (requested_port != 0 && addr.port() != requested_port) || client_addr.is_some_and(|v| v != addr) { continue; }
-                let Ok((target, offset)) = socks::parse_udp(&from_client[..n]) else { continue };
+                let Ok((target, offset)) = socks::parse_udp(&buf[..n]) else { continue };
                 client_addr = Some(addr);
                 if let socks::Target::Ip(dest) = target {
                     if !dest.is_ipv4() || (permitted.len() >= 1024 && !permitted.contains(&dest)) { continue; }
                     permitted.insert(dest);
-                    if let Err(e) = remote.send_to(&from_client[offset..n], dest).await { eprintln!("SOCKS UDP send: {e}"); }
+                    if let Err(e) = remote.send_to(&buf[offset..n], dest).await { eprintln!("SOCKS UDP send: {e}"); }
                     continue;
                 }
                 let Ok(permit) = pending.clone().try_acquire_owned() else { continue };
                 let Ok(global_permit) = cfg.udp_pending.clone().try_acquire_owned() else { continue };
-                let payload = from_client[offset..n].to_vec();
+                let payload = buf[offset..n].to_vec();
                 let sender = resolved_tx.clone();
                 let config = cfg.clone();
                 tokio::spawn(async move {
@@ -234,12 +258,17 @@ async fn udp_relay(
                 permitted.insert(dest);
                 if let Err(e) = remote.send_to(&payload, dest).await { eprintln!("SOCKS UDP send: {e}"); }
             }
-            r = remote.recv_from(&mut from_remote) => {
-                let (n, source) = r?;
+            r = remote.readable() => {
+                r?;
+                let (n, source) = match remote.try_recv_from(&mut buf) {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e),
+                };
                 if !permitted.contains(&source) { continue; }
                 if let Some(to) = client_addr {
                     let mut packet = socks::udp_header(source);
-                    packet.extend_from_slice(&from_remote[..n]); relay.send_to(&packet, to).await?;
+                    packet.extend_from_slice(&buf[..n]); relay.send_to(&packet, to).await?;
                 }
             }
         }
@@ -266,20 +295,31 @@ async fn main() -> io::Result<()> {
         dns_mark: 0x08000000,
         resolver: resolver::Resolver::default(),
         udp_pending: Arc::new(Semaphore::new(256)),
+        udp_sessions: Arc::new(Semaphore::new(256)),
     });
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     eprintln!("SOCKS listening on 127.0.0.1:{port} mark={mark:#x}");
     let clients = Arc::new(Semaphore::new(512));
     loop {
-        let (stream, _) = listener.accept().await?;
+        // Accept errors such as EMFILE are transient; exiting would let procd
+        // give up on the instance after a few respawns.
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                eprintln!("SOCKS accept: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let Ok(permit) = clients.clone().try_acquire_owned() else {
             continue;
         };
         let c = cfg.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = serve(stream, c).await {
-                eprintln!("SOCKS: {e}");
+            match serve(stream, c).await {
+                Err(e) if !is_routine(&e) => eprintln!("SOCKS: {e}"),
+                _ => {}
             }
         });
     }

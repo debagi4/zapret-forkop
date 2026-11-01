@@ -82,4 +82,15 @@ if start_locked >/dev/null 2>&1; then echo 'nft failure accepted' >&2; exit 1; f
 unset TEST_NFT_FAIL
 [ "$(readlink "$RUNTIME/current")" = "$old" ]
 [ "$(tail -n 1 "$tmp/register.log")" = "$old" ]
+
+# Failed attempts left candidates behind; a successful start keeps only its own.
+[ "$(ls -d "$RUNTIME"/candidate.* | wc -l | tr -d ' ')" -gt 1 ]
+start_locked >/dev/null
+current=$(readlink "$RUNTIME/current")
+[ "$(ls -d "$RUNTIME"/candidate.*)" = "$current" ]
+
+lock() { :; }
+stop
+[ ! -e "$RUNTIME/current" ]
+[ -z "$(ls -A "$RUNTIME")" ]
 echo 'service lifecycle rollback tests passed'

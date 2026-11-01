@@ -12,3 +12,11 @@ libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
+
+# Router flash and RAM are small. Unwinding is kept so a panic in one
+# connection task does not take down every relayed connection.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

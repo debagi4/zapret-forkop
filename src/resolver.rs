@@ -2,7 +2,7 @@ use crate::{connect, socks::Target};
 use std::{
     collections::HashMap,
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -10,19 +10,56 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::Instant;
 
+/// DoH servers tried in order. The next one is used only when the previous
+/// one fails or does not answer within `ATTEMPT_TIMEOUT`.
+const UPSTREAMS: [(&str, SocketAddrV4); 2] = [
+    (
+        "dns.google",
+        SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 443),
+    ),
+    (
+        "cloudflare-dns.com",
+        SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 443),
+    ),
+];
+/// Leaves time for the fallback within the 10 s lookup limit.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// EDNS(0) OPT record carrying an IPv4 Client Subnet option with source
+/// prefix /0 (RFC 7871): the resolver must not steer the answer by the
+/// requester's network, so the router's ISP prefix does not select the node.
+const ECS_NO_SUBNET: [u8; 19] = [
+    0, // root owner name
+    0, 41, // type OPT
+    4, 208, // UDP payload size 1232
+    0, 0, 0, 0, // extended RCODE, version, flags
+    0, 8, // RDATA length
+    0, 8, // option ECS
+    0, 4, // option length
+    0, 1, // family IPv4
+    0, 0, // source and scope prefix length
+];
+
 #[derive(Clone)]
 pub struct Resolver {
     cache: Arc<Mutex<HashMap<String, (Ipv4Addr, Instant)>>>,
     in_flight: Arc<Semaphore>,
     lookups: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+    tls: tokio_rustls::TlsConnector,
 }
 
 impl Default for Resolver {
     fn default() -> Self {
+        let roots =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
         Self {
             cache: Arc::new(Mutex::new(HashMap::new())),
             in_flight: Arc::new(Semaphore::new(32)),
             lookups: Arc::new(Mutex::new(HashMap::new())),
+            tls: tokio_rustls::TlsConnector::from(Arc::new(cfg)),
         }
     }
 }
@@ -45,9 +82,8 @@ fn query(name: &str) -> io::Result<Vec<u8>> {
     }
     b.extend([0, 0, 1, 0, 1]);
     if name.eq_ignore_ascii_case("redirector.googlevideo.com") {
-        // Request an address without sharing the client's network prefix.
-        b[11] = 1;
-        b.extend([0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 8, 0, 8, 0, 4, 0, 1, 0, 0]);
+        b[11] = 1; // ARCOUNT
+        b.extend(ECS_NO_SUBNET);
     }
     Ok(b)
 }
@@ -125,21 +161,18 @@ fn answer(b: &[u8]) -> io::Result<(Ipv4Addr, u32)> {
         "DNS has no IPv4 answer",
     ))
 }
-async fn doh(name: &str, mark: u32) -> io::Result<(Ipv4Addr, u32)> {
-    let body = query(name)?;
-    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
-    let tcp = connect("8.8.8.8:443".parse().unwrap(), mark).await?;
-    let server = rustls::pki_types::ServerName::try_from("dns.google")
-        .unwrap()
-        .to_owned();
+async fn doh(
+    connector: &tokio_rustls::TlsConnector,
+    (host, addr): (&'static str, SocketAddrV4),
+    body: &[u8],
+    mark: u32,
+) -> io::Result<(Ipv4Addr, u32)> {
+    let tcp = connect(addr.into(), mark).await?;
+    let server = rustls::pki_types::ServerName::try_from(host).map_err(io::Error::other)?;
     let mut tls = connector.connect(server, tcp).await?;
-    let header=format!("POST /dns-query HTTP/1.1\r\nHost: dns.google\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+    let header=format!("POST /dns-query HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
     tls.write_all(header.as_bytes()).await?;
-    tls.write_all(&body).await?;
+    tls.write_all(body).await?;
     let mut data = Vec::new();
     match tls.take(65536).read_to_end(&mut data).await {
         Ok(_) => {}
@@ -173,6 +206,26 @@ async fn doh(name: &str, mark: u32) -> io::Result<(Ipv4Addr, u32)> {
     answer(body)
 }
 impl Resolver {
+    async fn query_upstreams(&self, name: &str, mark: u32) -> io::Result<(Ipv4Addr, u32)> {
+        let body = query(name)?;
+        let mut last = None;
+        for upstream in UPSTREAMS {
+            let error =
+                match tokio::time::timeout(ATTEMPT_TIMEOUT, doh(&self.tls, upstream, &body, mark))
+                    .await
+                {
+                    Ok(Ok(answer)) => return Ok(answer),
+                    // A valid answer without A records is final; another server will agree.
+                    Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => return Err(e),
+                    Ok(Err(e)) => e,
+                    Err(_) => io::Error::new(io::ErrorKind::TimedOut, "DNS over HTTPS timeout"),
+                };
+            eprintln!("DoH {}: {error}", upstream.0);
+            last = Some(error);
+        }
+        Err(last.unwrap_or_else(invalid))
+    }
+
     async fn lookup_cached(&self, name: &str) -> Option<Ipv4Addr> {
         let mut cache = self.cache.lock().await;
         if let Some(&(address, expiry)) = cache.get(name) {
@@ -222,7 +275,7 @@ impl Resolver {
                         .acquire()
                         .await
                         .map_err(|_| io::Error::other("DNS service stopped"))?;
-                    let (ip, ttl) = doh(&name, mark).await?;
+                    let (ip, ttl) = self.query_upstreams(&name, mark).await?;
                     if ttl > 0 {
                         let mut cache = self.cache.lock().await;
                         if cache.len() >= 1024 {
@@ -257,11 +310,10 @@ mod tests {
     }
     #[test]
     fn ecs_is_limited_to_youtube_redirector() {
-        let ecs = [0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 8, 0, 8, 0, 4, 0, 1, 0, 0];
         for name in ["redirector.googlevideo.com", "REDIRECTOR.Googlevideo.Com."] {
             let q = query(name).unwrap();
             assert_eq!(q[11], 1);
-            assert!(q.ends_with(&ecs));
+            assert!(q.ends_with(&ECS_NO_SUBNET));
         }
         for name in [
             "googlevideo.com",

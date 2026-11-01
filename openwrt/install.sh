@@ -2,6 +2,8 @@
 # Installs files only. It never starts, stops or enables either bridge.
 set -eu
 umask 077
+# Backups stay private; installed directories must remain readable by services.
+mkdir_public() { (umask 022 && mkdir -p "$1"); }
 
 usage() { echo "Usage: sh install.sh [--root TEST_ROOT]" >&2; exit 2; }
 root=
@@ -53,7 +55,7 @@ restore() {
         # Until our own atomic replacement, never revert somebody else's edit.
         [ "$path" != /etc/config/firewall ] || [ "$firewall_installed" = 1 ] || continue
         if [ "$state" = present ]; then
-            mkdir -p "$(dirname "$root$path")"
+            mkdir_public "$(dirname "$root$path")"
             cp -p "$backup/files$path" "$root$path" || true
         else
             rm -f "$root$path"
@@ -91,7 +93,7 @@ install_file() {
     [ -f "$src$path" ] || { echo "Bundle is missing: $path" >&2; return 1; }
     backup_file "$path"
     dst="$root$path"
-    mkdir -p "$(dirname "$dst")"
+    mkdir_public "$(dirname "$dst")"
     tmpfile="$dst.zf-new.$$"
     cp "$src$path" "$tmpfile"
     chmod "$mode" "$tmpfile"
@@ -176,3 +178,4 @@ done_install=1
 echo "Files installed. Backup: $backup"
 echo "Neither service was started, stopped, enabled or disabled."
 echo "Firewall config saved; no firewall reload was performed."
+echo "To show the LuCI page, run: /etc/init.d/rpcd reload; rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache"

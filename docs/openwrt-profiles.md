@@ -33,17 +33,19 @@ The LuCI page presents a SOCKS outbound JSON for each saved profile. A user
 must add it to a Forkop connection section and choose the desired domains and
 devices there. Forkop is not modified automatically.
 
-Once registered with procd, a UCI change raises the service's config reload
-trigger. Ordinary `start`, `reload` and `restart` validate a candidate
+Every instance set is registered together with a `zapret_forkop` config
+reload trigger, so a saved UCI change (for example LuCI Save & Apply) reloads
+the running service. A stopped service has no trigger and stays stopped. Ordinary `start`, `reload` and `restart` validate a candidate
 before registering it. `stop` deletes only this application's table. On
 registration, readiness or nft transaction failure the service attempts to restore the
 last registered instance set; nft failure leaves the old nft table untouched.
-The candidate files stay in tmpfs for procd respawns.
+The active candidate stays in tmpfs for procd respawns; older candidates are
+removed after a successful switch and all of them on `stop`.
 
 A firewall include may call `/usr/libexec/zapret-forkop-firewall` to restore
 the current table following a firewall reload. The helper is a no-op when the
-service is stopped and uses an nft transaction. The include is intentionally
-not installed automatically by this development build.
+service is stopped and uses an nft transaction. `install.sh` adds this
+include as `firewall.zapret_forkop` but does not reload the firewall.
 
 ## Validation and known limitations
 
@@ -62,9 +64,11 @@ not installed automatically by this development build.
   and process state before any migration.
 - Process readiness and preflight ownership code have mocked local tests, and
   the ownership check has been exercised read-only against existing router
-  processes. New-service startup/respawn, browser LuCI apply behavior, firewall
-  reload, concurrent settings changes and a complete reboot are not yet
-  device-tested. Allocation checks are subject to races with unrelated services.
+  processes. On one Cudy TR3000, LuCI Save & Apply, firewall reload and reboot
+  were checked with the new service (see README). The UCI reload trigger was
+  added afterwards and still needs a device check; respawn after crashes and
+  concurrent settings changes are not device-tested. Allocation checks are
+  subject to races with unrelated services.
 - The SOCKS listener has no authentication and must bind only to loopback.
   A saved profile must not be mistaken for an applied or healthy profile.
 - Back up configurations and existing strategy files before migration. Use

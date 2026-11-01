@@ -60,6 +60,9 @@ return view.extend({
 		slot.rmempty = false;
 		slot.description = _('Each profile must have a unique number. SOCKS port: 11079 + number; queue: 4399 + number.');
 		slot.validate = function(section_id, value) {
+			// The service rejects leading zeros, which range() would accept.
+			if (!/^[1-9][0-9]{0,2}$/.test(value || ''))
+				return _('Use a number from 1 to 254 without leading zeros.');
 			for (var section of uci.sections('zapret_forkop', 'profile')) {
 				if (section['.name'] !== section_id && section.slot === value)
 					return _('Profile numbers must be unique.');
@@ -72,7 +75,9 @@ return view.extend({
 		strategy.wrap = true;
 		strategy.renderWidget = function(section_id, option_index, cfgvalue) {
 			var widget = form.TextValue.prototype.renderWidget.call(this, section_id, option_index, cfgvalue);
-			widget.querySelector('textarea').style.resize = 'vertical';
+			var textarea = widget.querySelector('textarea');
+			if (textarea)
+				textarea.style.resize = 'vertical';
 			return widget;
 		};
 		strategy.rmempty = false;

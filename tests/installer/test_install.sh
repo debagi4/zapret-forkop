@@ -56,6 +56,10 @@ sh "$tmp/bundle/install.sh" --root "$tmp/root" > "$tmp/result"
 [ -x "$tmp/root/usr/sbin/zapret-forkop" ]
 [ -f "$tmp/root/lib/upgrade/keep.d/zapret-forkop" ]
 grep -q "Neither service was started" "$tmp/result"
+# The installer's private umask must not hide new web directories from LuCI.
+for dir in www www/luci-static/resources/view/zapret-forkop usr/share/rpcd/acl.d; do
+    [ "$(ls -ld "$tmp/root/$dir" | cut -c1-10)" = drwxr-xr-x ] || { echo "unexpected mode: $dir" >&2; exit 1; }
+done
 backup=$(sed -n 's/^Files installed. Backup: //p' "$tmp/result")
 grep -q '# original firewall' "$backup/files/etc/config/firewall"
 grep -q '# mock-section' "$tmp/root/etc/config/firewall"

@@ -66,4 +66,9 @@ TEST_FIRST_STRATEGY='--filter-tcp=443 --qnum=1'; export TEST_FIRST_STRATEGY; rej
 TEST_FIRST_STRATEGY='--filter-tcp=443 @/tmp/options'; export TEST_FIRST_STRATEGY; reject
 TEST_FIRST_STRATEGY='--filter-tcp=443 --reject-by-test'; export TEST_FIRST_STRATEGY; reject
 TEST_FIRST_STRATEGY='--filter-tcp=443 --daemon'; export TEST_FIRST_STRATEGY; reject
+reserved=$(sed -n 's/^ *\(--qnum|[^)]*\)).*/\1/p' "$prepare" | tr '|' ' ')
+[ "$(echo $reserved | wc -w)" -ge 8 ]
+for option in $reserved; do
+    TEST_FIRST_STRATEGY="--filter-tcp=443 $option=1"; export TEST_FIRST_STRATEGY; reject
+done
 echo 'profile preparation tests passed'
