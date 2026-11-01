@@ -44,6 +44,11 @@ fn query(name: &str) -> io::Result<Vec<u8>> {
         b.extend(part.as_bytes());
     }
     b.extend([0, 0, 1, 0, 1]);
+    if name.eq_ignore_ascii_case("redirector.googlevideo.com") {
+        // Request an address without sharing the client's network prefix.
+        b[11] = 1;
+        b.extend([0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 8, 0, 8, 0, 4, 0, 1, 0, 0]);
+    }
     Ok(b)
 }
 fn skip_name(b: &[u8], mut p: usize) -> io::Result<usize> {
@@ -249,6 +254,22 @@ mod tests {
     fn rejects_bad_names() {
         assert!(query("a..b").is_err());
         assert!(query("").is_err());
+    }
+    #[test]
+    fn ecs_is_limited_to_youtube_redirector() {
+        let ecs = [0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 8, 0, 8, 0, 4, 0, 1, 0, 0];
+        for name in ["redirector.googlevideo.com", "REDIRECTOR.Googlevideo.Com."] {
+            let q = query(name).unwrap();
+            assert_eq!(q[11], 1);
+            assert!(q.ends_with(&ecs));
+        }
+        for name in [
+            "googlevideo.com",
+            "rr1.googlevideo.com",
+            "redirector.googlevideo.com.evil",
+        ] {
+            assert_eq!(query(name).unwrap()[11], 0);
+        }
     }
     #[test]
     fn parses_compressed_answer() {

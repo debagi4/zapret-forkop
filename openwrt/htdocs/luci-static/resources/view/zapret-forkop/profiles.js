@@ -38,6 +38,12 @@ return view.extend({
 
 		var strategy = s.option(form.TextValue, 'strategy', _('Zapret 1 strategy'));
 		strategy.rows = 8;
+		strategy.wrap = true;
+		strategy.renderWidget = function(section_id, option_index, cfgvalue) {
+			var widget = form.TextValue.prototype.renderWidget.call(this, section_id, option_index, cfgvalue);
+			widget.querySelector('textarea').style.resize = 'vertical';
+			return widget;
+		};
 		strategy.rmempty = false;
 		strategy.modalonly = true;
 		strategy.description = _('Arguments for nfqws. Queue and firewall mark are assigned by the service; do not include --qnum or --dpi-desync-fwmark.');

@@ -60,6 +60,10 @@ async fn connect(addr: SocketAddr, mark: u32) -> io::Result<TcpStream> {
         socket2::Protocol::TCP,
         mark,
     )?;
+    // Bound the lifetime of unacknowledged data or FINs without timing out
+    // healthy idle connections. This also releases their paired SOCKS sockets.
+    #[cfg(target_os = "linux")]
+    socket.set_tcp_user_timeout(Some(Duration::from_secs(30)))?;
     match socket.connect(&addr.into()) {
         Ok(()) => {}
         Err(e)
