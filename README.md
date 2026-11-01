@@ -66,7 +66,7 @@ A separately named test copy of the new service passed start, reload, invalid re
 
 Pull requests and pushes to `main` run the Rust, SOCKS TCP/UDP, LuCI and
 installer checks; Actions then builds an OpenWrt AArch64 archive and its
-SHA-256 checksum, available as run artifacts. Pushing a tag such as `v0.1.0`
+SHA-256 checksum, available as run artifacts. Pushing a tag such as `v0.2.0`
 that matches the version in Cargo.toml creates a GitHub Release with the
 archive and SHA256SUMS after the checks pass.
 
