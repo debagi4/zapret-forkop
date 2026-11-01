@@ -2,6 +2,37 @@
 'require view';
 'require form';
 'require uci';
+'require ui';
+
+function outboundJSON(section_id) {
+	var n = +uci.get('zapret_forkop', section_id, 'slot');
+	if (!Number.isInteger(n) || n < 1 || n > 254)
+		return null;
+	return JSON.stringify({ type: 'socks', tag: 'Zapret-' + n, server: '127.0.0.1',
+		server_port: 11079 + n, version: '5' });
+}
+
+function copyText(text) {
+	if (navigator.clipboard && window.isSecureContext)
+		return navigator.clipboard.writeText(text);
+
+	// LuCI is often served over HTTP, where the Clipboard API is unavailable.
+	var input = document.createElement('textarea');
+	input.value = text;
+	input.style.position = 'fixed';
+	input.style.left = '-9999px';
+	document.body.appendChild(input);
+	input.select();
+	try {
+		return document.execCommand('copy') ? Promise.resolve() : Promise.reject();
+	}
+	catch (e) {
+		return Promise.reject(e);
+	}
+	finally {
+		input.remove();
+	}
+}
 
 return view.extend({
 	load: function() {
@@ -63,13 +94,33 @@ return view.extend({
 		var outbound = s.option(form.DummyValue, '_outbound', _('Forkop SOCKS outbound JSON'));
 		outbound.modalonly = true;
 		outbound.cfgvalue = function(section_id) {
-			var n = +uci.get('zapret_forkop', section_id, 'slot');
-			if (!Number.isInteger(n) || n < 1 || n > 254)
-				return _('Save a valid profile number first.');
-			return JSON.stringify({ type: 'socks', tag: 'Zapret-' + n, server: '127.0.0.1',
-				server_port: 11079 + n, version: '5' });
+			return outboundJSON(section_id) || _('Save a valid profile number first.');
 		};
 		outbound.description = _('Use this JSON as the outbound in a Forkop section. The profile number must be saved first.');
+
+		var copy = s.option(form.Button, '_copy_outbound', _('Forkop config'));
+		copy.inputtitle = _('Copy');
+		copy.inputstyle = 'action';
+		copy.modalonly = false;
+		copy.textvalue = function(section_id) {
+			return E('button', {
+				'type': 'button',
+				'class': 'cbi-button cbi-button-action',
+				'click': function(ev) { return copy.onclick(ev, section_id); }
+			}, _('Copy'));
+		};
+		copy.onclick = function(ev, section_id) {
+			var value = outboundJSON(section_id);
+			if (!value) {
+				ui.addNotification(null, E('p', _('Save a valid profile number first.')), 'warning');
+				return;
+			}
+			return copyText(value).then(function() {
+				ui.addTimeLimitedNotification(null, E('p', _('Forkop config copied.')), 3000, 'info');
+			}, function() {
+				ui.addNotification(null, E('p', _('Could not copy. Open the profile and copy the JSON manually.')), 'warning');
+			});
+		};
 		return map.render();
 	}
 });
